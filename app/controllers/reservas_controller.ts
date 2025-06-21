@@ -11,18 +11,17 @@ export default class ReservasController {
 
   // Crear una reserva evitando superposición de fechas
   async store({ request, response }: HttpContext) {
-    // Obtenemos el payload desde el request (formato snake_case)
     const payload = request.only(['cliente_id', 'habitacion_id', 'fecha_inicio', 'fecha_fin'])
 
-    // Mapeamos al formato camelCase que espera el modelo
     const data = {
       clienteId: payload.cliente_id,
       habitacionId: payload.habitacion_id,
       fechaInicio: payload.fecha_inicio,
       fechaFin: payload.fecha_fin,
+      estado: 'confirmada' as 'confirmada', // Aquí fuerzas el tipo literal permitido
     }
 
-    // Verificamos si existen reservas superpuestas en las mismas fechas para la misma habitación
+    // Validación de traslapes
     const reservasSuperpuestas = await db
       .from('reservas')
       .where('habitacion_id', data.habitacionId)
@@ -45,7 +44,6 @@ export default class ReservasController {
       return response.badRequest({ message: 'La habitación ya está reservada en esas fechas.' })
     }
 
-    // Creamos la reserva porque no hay conflicto
     const reserva = await Reserva.create(data)
     return response.created(reserva)
   }
@@ -65,18 +63,51 @@ export default class ReservasController {
     }
   }
 
-  // Actualizar el estado de una reserva (confirmada, cancelada, finalizada)
+  // Actualizar una reserva evitando traslape de fechas
   async update({ params, request, response }: HttpContext) {
     try {
       const reserva = await Reserva.findOrFail(params.id)
-      const { estado } = request.only(['estado'])
+      const payload = request.only(['estado', 'fecha_inicio', 'fecha_fin', 'habitacion_id'])
 
-      // Opcional: puedes validar aquí que solo se permitan los estados válidos
-      if (!['confirmada', 'cancelada', 'finalizada'].includes(estado)) {
+      // Opcional: validar estado
+      if (payload.estado && !['confirmada', 'cancelada', 'finalizada'].includes(payload.estado)) {
         return response.badRequest({ message: 'Estado inválido' })
       }
 
-      reserva.estado = estado
+      // Validar traslape solo si se cambia fecha o habitación
+      if (payload.fecha_inicio && payload.fecha_fin && payload.habitacion_id) {
+        const reservasSuperpuestas = await db
+          .from('reservas')
+          .where('habitacion_id', payload.habitacion_id)
+          .where('estado', 'confirmada')
+          .whereNot('id', reserva.id) // Importante: excluir la reserva actual
+          .whereRaw(
+            `(fecha_inicio <= ? AND fecha_fin >= ?)
+             OR (fecha_inicio <= ? AND fecha_fin >= ?)
+             OR (fecha_inicio >= ? AND fecha_fin <= ?)`,
+            [
+              payload.fecha_fin,
+              payload.fecha_fin,
+              payload.fecha_inicio,
+              payload.fecha_inicio,
+              payload.fecha_inicio,
+              payload.fecha_fin,
+            ]
+          )
+
+        if (reservasSuperpuestas.length > 0) {
+          return response.badRequest({ message: 'La habitación ya está reservada en esas fechas.' })
+        }
+      }
+
+      // Actualizar campos
+      reserva.merge({
+        estado: payload.estado ?? reserva.estado,
+        fechaInicio: payload.fecha_inicio ?? reserva.fechaInicio,
+        fechaFin: payload.fecha_fin ?? reserva.fechaFin,
+        habitacionId: payload.habitacion_id ?? reserva.habitacionId,
+      })
+
       await reserva.save()
       return reserva
     } catch (error) {
